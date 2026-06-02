@@ -1,0 +1,15 @@
+{{define "install_card"}}
+<article class="install-card">
+  <h3>{{.Name}}</h3>
+  <details open>
+    <summary>Install</summary>
+    <pre class="snippet"><code>{{.InstallCommand}}</code></pre>
+    <button type="button" class="copy-btn" data-copy-target="prev">Copy</button>
+  </details>
+  <details>
+    <summary>Remove</summary>
+    <pre class="snippet"><code>{{.RemoveCommand}}</code></pre>
+    <button type="button" class="copy-btn" data-copy-target="prev">Copy</button>
+  </details>
+</article>
+{{end}}

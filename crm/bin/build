@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# bin/build — produce the deploy artifacts for the crm service.
+#
+# Outputs in $REPO/build/:
+#   build/crm      — shell wrapper that becomes /opt/crm/bin/run
+#                    (metaspot-launch exec()s this). Composes the public-origin
+#                    CRM_RESOURCE_ID / CRM_AUTH_SERVER from METASPOT_DOMAIN and
+#                    execs the real binary with its listen flags.
+#   build/crm.bin  — the Go binary (linux/amd64, static, stripped),
+#                    shipped to /opt/crm/bin/crm.bin.
+#
+# metaspot-launch exec()s /opt/<app>/bin/run with no args (it has already sourced
+# /etc/metaspot/env and manifest.env, so METASPOT_DOMAIN and PORT are in the env).
+# crm has no secrets and no SSM app-config key — it trusts the identity headers
+# nginx injects, so the wrapper only sets non-secret public config.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+. etc/manifest.env
+
+VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+
+mkdir -p build
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+    -o "build/${APP}.bin" ./cmd/crm
+
+cat > "build/${APP}" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${METASPOT_DOMAIN:?metaspot-launch must have sourced /etc/metaspot/env}"
+: "${PORT:?PORT must be set (etc/manifest.env)}"
+# crm is a path-routed service mounted at /srv/crm/ behind nginx. Its canonical
+# resource id is the public mount URL, and the AS it points clients at is the
+# apex front door — both built from the bare account domain.
+export CRM_RESOURCE_ID="https://${METASPOT_DOMAIN}/srv/crm/mcp"
+export CRM_AUTH_SERVER="https://${METASPOT_DOMAIN}"
+export CRM_DB_PATH=/opt/crm/data/crm.db
+exec /opt/crm/bin/crm.bin \
+  --ip 127.0.0.1 \
+  --port "${PORT}"
+WRAPPER
+chmod 0755 "build/${APP}"
+
+echo "build/${APP}"
+echo "build/${APP}.bin"

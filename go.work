@@ -1,0 +1,15 @@
+// go.work — local-dev workspace for the on-box suite's Go modules. Lets the
+// service modules resolve the shared `eventplane` library from its sibling
+// source tree without a network fetch. Production builds do NOT rely on this
+// file: each consumer also carries a committed `replace eventplane =>
+// ../eventplane` in its go.mod, so `bin/build` is deterministic with or without
+// the workspace.
+go 1.26
+
+use (
+	./crm
+	./dashboard
+	./eventplane
+	./ledger
+	./notify
+)

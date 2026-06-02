@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# bin/build — produce the deploy artifacts for the dashboard app.
+#
+# Outputs in $REPO/build/:
+#   build/dashboard      — shell wrapper that becomes /opt/dashboard/bin/run
+#                          (metaspot-launch exec()s this). Composes
+#                          DASHBOARD_PUBLIC_BASE_URL from METASPOT_DOMAIN and
+#                          execs the real binary with serve args.
+#   build/dashboard.bin  — the Go binary (linux/amd64, static, stripped),
+#                          shipped to /opt/dashboard/bin/dashboard.bin.
+#
+# metaspot-launch exec()s /opt/<app>/bin/run with no args (it has already
+# sourced /etc/metaspot/env and manifest.env and injected the SSM app-config
+# blob, so METASPOT_DOMAIN, PORT, and the GOOGLE_* creds are in the env). The
+# dashboard binary's `serve` subcommand takes flags; the wrapper bridges that —
+# per-app shape stays out of the otherwise-generic deploy.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+. etc/manifest.env
+
+VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+
+mkdir -p build
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+    -o "build/${APP}.bin" ./cmd/dashboard
+
+cat > "build/${APP}" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${METASPOT_DOMAIN:?metaspot-launch must have sourced /etc/metaspot/env}"
+: "${PORT:?PORT must be set (etc/manifest.env)}"
+# The dashboard is the apex app: its public origin is the bare account domain,
+# the exact redirect_uri origin Google sends the user back to.
+export DASHBOARD_PUBLIC_BASE_URL="https://${METASPOT_DOMAIN}"
+# Resource identifiers the AS mints tokens for — the nginx-fronted /srv/<svc>/mcp
+# mounts, same origin as the public base URL. Required by the serve command.
+# One entry per MCP service on the box (≤3): crm + the ledger skeleton + notify.
+export DASHBOARD_RESOURCES="https://${METASPOT_DOMAIN}/srv/crm/mcp,https://${METASPOT_DOMAIN}/srv/ledger/mcp,https://${METASPOT_DOMAIN}/srv/notify/mcp"
+exec /opt/dashboard/bin/dashboard.bin serve \
+  --ip 127.0.0.1 \
+  --port "${PORT}" \
+  --db /opt/dashboard/data/dashboard.db
+WRAPPER
+chmod 0755 "build/${APP}"
+
+echo "build/${APP}"
+echo "build/${APP}.bin"

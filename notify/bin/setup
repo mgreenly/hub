@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# bin/setup — one-time, idempotent box prep for the notify service.
+#
+# notify is a path-routed service: it owns NOTHING global. Per
+# docs/path-routing-architecture.md the dashboard owns the apex server block, the
+# single TLS cert, and the /_authn introspection hook. This script only:
+#   - prepares the app user, layout, and systemd unit (via metaspot-launch), and
+#   - drops notify's nginx location fragment at
+#     /etc/nginx/conf.d/locations/notify.conf (its two location blocks), then
+#     validates and reloads nginx.
+# It does NOT install a server block and does NOT issue a TLS cert.
+#
+# Reads etc/manifest.env (APP/PORT) and etc/deploy.env (ACCOUNT/SSH_*). Assumes
+# the box is already provisioned (dashboard/bin/setup ran first, so the apex
+# server block, cert, /_authn, and the conf.d/locations/ include dir exist).
+#
+# Does NOT start the service — bin/deploy ships the artifact and starts it.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+. etc/manifest.env
+. etc/deploy.env
+
+HOST="${HOST:-${ACCOUNT}.metaspot.org}"
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+echo ">> setup: ${SSH_USER}@${HOST}  app=${APP}  mount=${MOUNT}  port=${PORT}  (service fragment only)"
+
+# The nginx location fragment is literal (no placeholders) — see etc/nginx.conf.
+FRAGMENT="$(cat etc/nginx.conf)"
+
+UNIT="$(cat <<EOF
+[Unit]
+Description=${APP}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${APP}
+WorkingDirectory=/opt/${APP}
+EnvironmentFile=/etc/metaspot/env
+ExecStart=/usr/local/bin/metaspot-launch ${APP}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)"
+
+FRAGMENT_B64="$(printf '%s\n' "$FRAGMENT" | base64 -w0)"
+UNIT_B64="$(printf '%s\n' "$UNIT" | base64 -w0)"
+
+ssh -i "$SSH_KEY" "${SSH_USER}@${HOST}" \
+  "sudo APP='$APP' \
+        FRAGMENT_B64='$FRAGMENT_B64' UNIT_B64='$UNIT_B64' \
+        bash -s" <<'REMOTE'
+set -euo pipefail
+: "${APP:?}" "${FRAGMENT_B64:?}" "${UNIT_B64:?}"
+FRAGMENT="$(printf '%s' "$FRAGMENT_B64" | base64 -d)"
+UNIT="$(printf  '%s' "$UNIT_B64"  | base64 -d)"
+
+[ -r /etc/metaspot/env ] || { echo "!! /etc/metaspot/env missing (bootstrap not run?)" >&2; exit 1; }
+[ -x /usr/local/bin/metaspot-launch ] || { echo "!! /usr/local/bin/metaspot-launch missing (bootstrap not run?)" >&2; exit 1; }
+[ -d /etc/nginx/conf.d/locations ] || { echo "!! /etc/nginx/conf.d/locations missing (dashboard/bin/setup not run?)" >&2; exit 1; }
+
+echo ">> packages"
+dnf install -y awscli-2 jq >/dev/null
+
+echo ">> app user + layout"
+id "$APP" &>/dev/null || useradd --system --home-dir "/opt/${APP}" --shell /usr/sbin/nologin "$APP"
+install -d -o "$APP" -g "$APP" -m 0755 "/opt/${APP}" "/opt/${APP}/bin" "/opt/${APP}/etc"
+install -d -o "$APP" -g "$APP" -m 0750 "/opt/${APP}/data"
+chmod 0755 /opt "/opt/${APP}"
+
+echo ">> systemd unit"
+printf '%s\n' "$UNIT" > "/etc/systemd/system/${APP}.service"
+systemctl daemon-reload
+systemctl enable "${APP}.service" >/dev/null
+
+echo ">> nginx location fragment"
+printf '%s\n' "$FRAGMENT" > "/etc/nginx/conf.d/locations/${APP}.conf"
+nginx -t
+systemctl reload nginx
+
+echo ">> done."
+echo "   nginx:          $(systemctl is-active nginx)"
+echo "   ${APP}.service: $(systemctl is-enabled "${APP}.service") / $(systemctl is-active "${APP}.service" || true)"
+REMOTE
+
+echo ">> setup complete. Next: bin/secrets (seed app-config), then bin/deploy to ship the artifact and start the service."

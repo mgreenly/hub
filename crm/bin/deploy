@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# bin/deploy — build off-box, ship the artifact + binary, restart.
+#
+# Ships TWO files: a wrapper (build/${APP}) and the real Go binary
+# (build/${APP}.bin) — see bin/build for why. Otherwise the standard
+# "stop -> rsync -> start" shape.
+#
+# Production state (/opt/crm/data/crm.db) is created by the app on first start
+# and lives outside the deploy — deploy never touches it. Requires the box
+# scaffolding from bin/setup (app user, /opt/crm tree, systemd unit, nginx
+# location fragment) to already exist, and the dashboard's apex setup (server
+# block, cert, /_authn) to have run first.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+. etc/manifest.env
+. etc/deploy.env
+
+HOST="${HOST:-${ACCOUNT}.metaspot.org}"
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+echo ">> build"
+"./bin/build" >/dev/null
+WRAP="build/${APP}"
+BIN="build/${APP}.bin"
+[ -x "$WRAP" ] || { echo "!! bin/build did not produce ${WRAP}" >&2; exit 1; }
+[ -x "$BIN"  ] || { echo "!! bin/build did not produce ${BIN}"  >&2; exit 1; }
+
+echo ">> stop ${APP}"
+ssh -i "$SSH_KEY" "${SSH_USER}@${HOST}" "sudo systemctl stop ${APP} || true"
+
+echo ">> rsync ${WRAP} -> /opt/${APP}/bin/run"
+rsync -az --chmod=F755 \
+  -e "ssh -i ${SSH_KEY}" \
+  --rsync-path="sudo rsync" \
+  "$WRAP" "${SSH_USER}@${HOST}:/opt/${APP}/bin/run"
+
+echo ">> rsync ${BIN} -> /opt/${APP}/bin/${APP}.bin"
+rsync -az --chmod=F755 \
+  -e "ssh -i ${SSH_KEY}" \
+  --rsync-path="sudo rsync" \
+  "$BIN" "${SSH_USER}@${HOST}:/opt/${APP}/bin/${APP}.bin"
+
+echo ">> rsync etc/manifest.env -> /opt/${APP}/etc/manifest.env"
+rsync -az --chmod=F644 \
+  -e "ssh -i ${SSH_KEY}" \
+  --rsync-path="sudo rsync" \
+  "etc/manifest.env" "${SSH_USER}@${HOST}:/opt/${APP}/etc/manifest.env"
+
+echo ">> chown + start"
+ssh -i "$SSH_KEY" "${SSH_USER}@${HOST}" "sudo bash -s" <<REMOTE
+set -euo pipefail
+chown -R ${APP}:${APP} /opt/${APP}
+systemctl start ${APP}
+sleep 1
+systemctl is-active ${APP}
+REMOTE
+
+echo ">> deploy complete."

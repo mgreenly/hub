@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# bin/start — start the dashboard's systemd service on the box.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO/etc/manifest.env"
+. "$REPO/etc/deploy.env"
+
+HOST="${HOST:-${ACCOUNT}.metaspot.org}"
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+ssh -i "$SSH_KEY" "${SSH_USER}@${HOST}" \
+  "sudo systemctl start ${APP} && systemctl is-active ${APP}"

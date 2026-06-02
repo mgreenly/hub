@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# bin/stop — stop the dashboard's systemd service on the box.
+# nginx keeps running and will return 502 until bin/start. This is fine per spec.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO/etc/manifest.env"
+. "$REPO/etc/deploy.env"
+
+HOST="${HOST:-${ACCOUNT}.metaspot.org}"
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+ssh -i "$SSH_KEY" "${SSH_USER}@${HOST}" \
+  "sudo systemctl stop ${APP} || true; systemctl is-active ${APP} || true"

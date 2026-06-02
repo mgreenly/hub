@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# bin/start — run notify locally on its loopback port, writing its PID to build/notify.pid.
+#
+# Local-run only. The systemd-on-the-box lifecycle lands with bin/deploy later.
+# notify binds 127.0.0.1 by default; nginx is its only real ingress.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+. etc/manifest.env
+
+BIN="build/${APP}.bin"
+PIDFILE="build/${APP}.pid"
+
+if [[ ! -x "$BIN" ]]; then
+  bin/build
+fi
+
+if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  echo "notify already running (pid $(cat "$PIDFILE"))" >&2
+  exit 1
+fi
+
+NOTIFY_PORT="${NOTIFY_PORT:-${PORT}}" "./$BIN" --port "${NOTIFY_PORT:-${PORT}}" &
+echo $! > "$PIDFILE"
+echo "notify started (pid $(cat "$PIDFILE")) on 127.0.0.1:${NOTIFY_PORT:-${PORT}}"

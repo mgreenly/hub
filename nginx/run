@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Foreground dev nginx for the metaspot suite. Ctrl-C to stop.
+# Unprivileged: all state (pid, logs, temp) stays under this directory.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec /usr/sbin/nginx -p "$here" -c "$here/nginx.conf" -g 'daemon off;'

@@ -1,0 +1,28 @@
+# marketplace stays its own standalone repo (mgreenly/marketplace, public).
+# It lives here on disk but is NOT part of the hub monorepo — git never
+# descends into it, so its own .git and the public plugin-add URL are preserved.
+/marketplace/
+
+# --- Build artifacts ---
+/*/build/
+/dashboard/bin/dashboard
+
+# --- Runtime SQLite state ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# --- Local environment ---
+.env
+.env.local
+.direnv/
+
+# --- Editor / OS ---
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

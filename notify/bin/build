@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# bin/build — produce the deploy artifacts for the notify service.
+#
+# Outputs in $REPO/build/:
+#   build/notify      — shell wrapper that becomes /opt/notify/bin/run
+#                    (metaspot-launch exec()s this). Composes the public-origin
+#                    NOTIFY_RESOURCE_ID / NOTIFY_AUTH_SERVER from METASPOT_DOMAIN and
+#                    execs the real binary with its listen flags.
+#   build/notify.bin  — the Go binary (linux/amd64, static, stripped),
+#                    shipped to /opt/notify/bin/notify.bin.
+#
+# metaspot-launch exec()s /opt/<app>/bin/run with no args (it has already sourced
+# /etc/metaspot/env and manifest.env AND the SSM app-config secrets, so
+# METASPOT_DOMAIN, PORT, and notify's ntfy secrets are already in the env). The
+# wrapper sets only non-secret public config (resource id, auth server, the
+# event-plane feed address, the ntfy base URL) and execs the binary; it never
+# touches NTFY_TOPIC / NTFY_API_KEY, which arrive from app-config and are read by
+# the binary via getenv at its composition root.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+. etc/manifest.env
+
+VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+
+mkdir -p build
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+    -o "build/${APP}.bin" ./cmd/notify
+
+cat > "build/${APP}" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${METASPOT_DOMAIN:?metaspot-launch must have sourced /etc/metaspot/env}"
+: "${PORT:?PORT must be set (etc/manifest.env)}"
+# notify is a path-routed service mounted at /srv/notify/ behind nginx. Its canonical
+# resource id is the public mount URL, and the AS it points clients at is the
+# apex front door — both built from the bare account domain.
+export NOTIFY_RESOURCE_ID="https://${METASPOT_DOMAIN}/srv/notify/mcp"
+export NOTIFY_AUTH_SERVER="https://${METASPOT_DOMAIN}"
+export NOTIFY_DB_PATH=/opt/notify/data/notify.db
+# Event-plane consumer config. The feed is crm's loopback port — the event plane
+# bypasses nginx (event-protocol.md §2), so this is a direct 127.0.0.1 address.
+# NTFY_TOPIC / NTFY_API_KEY are NOT set here: they are app-config secrets already
+# in the environment.
+export NOTIFY_FEED_URL="http://127.0.0.1:3001/feed"
+export NOTIFY_FROM="tail"
+export NOTIFY_NTFY_BASE_URL="https://ntfy.sh"
+exec /opt/notify/bin/notify.bin \
+  --ip 127.0.0.1 \
+  --port "${PORT}"
+WRAPPER
+chmod 0755 "build/${APP}"
+
+echo "build/${APP}"
+echo "build/${APP}.bin"

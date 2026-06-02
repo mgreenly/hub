@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# bin/stop — stop the locally-running crm started by bin/start.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+. etc/manifest.env
+
+PIDFILE="build/${APP}.pid"
+
+if [[ ! -f "$PIDFILE" ]]; then
+  echo "crm not running (no pidfile)" >&2
+  exit 0
+fi
+
+PID="$(cat "$PIDFILE")"
+if kill -0 "$PID" 2>/dev/null; then
+  kill "$PID"
+  echo "crm stopped (pid $PID)"
+else
+  echo "crm not running (stale pidfile)" >&2
+fi
+rm -f "$PIDFILE"

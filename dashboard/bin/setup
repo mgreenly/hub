@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# bin/setup — one-time, idempotent box prep for the dashboard (the apex app).
+#
+# Reads etc/manifest.env (APP/PORT) and etc/deploy.env (ACCOUNT/SSH_*/
+# CERTBOT_EMAIL); ships etc/nginx.conf (the apex server block) with placeholder
+# substitution. Assumes the box is already provisioned with /etc/metaspot/env
+# and /usr/local/bin/metaspot-launch (installed by instance bootstrap).
+#
+# The dashboard owns the apex: the single ai.metaspot.org server block, the one
+# apex TLS cert, the conf.d/locations/ include dir (where path-routed services
+# drop fragments), and the ACME-challenge location. See
+# docs/path-routing-architecture.md.
+#
+# Cert acquisition is a three-way, backup-aware decision (idempotent, and never
+# trips Let's Encrypt rate limits on a rebuild):
+#   1. cert already live on the box   -> use it
+#   2. else a cert backup in S3       -> restore it (no issuance)
+#   3. else                           -> issue fresh via HTTP-01 webroot
+# bin/backup snapshots the cert to S3, so teardown --purge-cert is recoverable.
+#
+# Does NOT start the service — bin/deploy ships the artifact and starts it.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+. etc/manifest.env
+. etc/deploy.env
+
+HOST="${HOST:-${ACCOUNT}.metaspot.org}"
+DOMAIN="${DOMAIN:-${ACCOUNT}.metaspot.org}"
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+# The dashboard is always the apex/DEFAULT app: it answers on the bare account
+# domain only (no per-app subdomain), so the cert is a single name.
+CERT_DOMAINS="-d ${DOMAIN}"
+
+echo ">> setup: ${SSH_USER}@${HOST}  app=${APP}  domain=${DOMAIN}  port=${PORT}"
+
+VHOST="$(
+  sed -e "s/__DOMAIN__/${DOMAIN}/g" \
+      -e "s/__PORT__/${PORT}/g" \
+      etc/nginx.conf
+)"
+
+UNIT="$(cat <<EOF
+[Unit]
+Description=${APP}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${APP}
+WorkingDirectory=/opt/${APP}
+EnvironmentFile=/etc/metaspot/env
+ExecStart=/usr/local/bin/metaspot-launch ${APP}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)"
+
+VHOST_B64="$(printf '%s\n' "$VHOST" | base64 -w0)"
+UNIT_B64="$(printf '%s\n' "$UNIT" | base64 -w0)"
+
+ssh -i "$SSH_KEY" "${SSH_USER}@${HOST}" \
+  "sudo APP='$APP' DOMAIN='$DOMAIN' EMAIL='$CERTBOT_EMAIL' \
+        CERT_DOMAINS='$CERT_DOMAINS' \
+        VHOST_B64='$VHOST_B64' UNIT_B64='$UNIT_B64' \
+        bash -s" <<'REMOTE'
+set -euo pipefail
+: "${APP:?}" "${DOMAIN:?}" "${EMAIL:?}" "${CERT_DOMAINS:?}" "${VHOST_B64:?}" "${UNIT_B64:?}"
+VHOST="$(printf '%s' "$VHOST_B64" | base64 -d)"
+UNIT="$(printf  '%s' "$UNIT_B64"  | base64 -d)"
+
+[ -r /etc/metaspot/env ] || { echo "!! /etc/metaspot/env missing (bootstrap not run?)" >&2; exit 1; }
+[ -x /usr/local/bin/metaspot-launch ] || { echo "!! /usr/local/bin/metaspot-launch missing (bootstrap not run?)" >&2; exit 1; }
+
+echo ">> packages"
+dnf install -y nginx certbot awscli-2 jq >/dev/null
+
+echo ">> app user + layout"
+id "$APP" &>/dev/null || useradd --system --home-dir "/opt/${APP}" --shell /usr/sbin/nologin "$APP"
+install -d -o "$APP"  -g "$APP"  -m 0755 "/opt/${APP}" "/opt/${APP}/bin" "/opt/${APP}/etc"
+install -d -o "$APP"  -g "$APP"  -m 0750 "/opt/${APP}/data"
+install -d -o root    -g root    -m 0755 /var/lib/letsencrypt
+install -d -o root    -g root    -m 0755 /etc/nginx/conf.d/locations
+chmod 0755 /opt "/opt/${APP}"
+
+echo ">> systemd unit"
+printf '%s\n' "$UNIT" > "/etc/systemd/system/${APP}.service"
+systemctl daemon-reload
+systemctl enable "${APP}.service" >/dev/null
+
+LIVE="/etc/letsencrypt/live/${DOMAIN}"
+
+write_vhost() { printf '%s\n' "$VHOST" > "/etc/nginx/conf.d/${APP}.conf"; }
+
+write_bootstrap_vhost() {
+  cat > "/etc/nginx/conf.d/${APP}.conf" <<EOF
+# managed by ${APP}/bin/setup — bootstrap, pre-certificate
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt;
+        default_type "text/plain";
+    }
+    location / { return 404; }
+}
+EOF
+}
+
+# restore_cert_from_s3 — pull the newest cert snapshot bin/backup pushed to
+# s3://$BUCKET/${APP}/cert/ and unpack it into /etc/letsencrypt (archive +
+# renewal + live symlinks, paths stored relative to /). Returns non-zero if no
+# usable backup exists, so the caller falls through to fresh issuance.
+restore_cert_from_s3() {
+  command -v aws >/dev/null 2>&1 || return 1
+  . /etc/metaspot/env
+  [ -n "${METASPOT_BACKUP_BUCKET:-}" ] || return 1
+  export AWS_DEFAULT_REGION="${METASPOT_AWS_REGION:-us-east-2}"
+  local b="$METASPOT_BACKUP_BUCKET" key tmp
+  key="$(aws s3 cp "s3://$b/${APP}/cert/latest" - 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$key" ] || return 1
+  aws s3api head-object --bucket "$b" --key "$key" >/dev/null 2>&1 || return 1
+  tmp="$(mktemp -d)"
+  if aws s3 cp --no-progress "s3://$b/$key" "$tmp/cert.tar.gz" 2>/dev/null; then
+    tar -xpzf "$tmp/cert.tar.gz" -C /
+    rm -rf "$tmp"
+    return 0
+  fi
+  rm -rf "$tmp"
+  return 1
+}
+
+if [ -d "$LIVE" ]; then
+  echo ">> certificate present on box — installing final vhost"
+  write_vhost
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx
+elif restore_cert_from_s3 && [ -d "$LIVE" ]; then
+  echo ">> certificate restored from S3 backup — installing final vhost"
+  write_vhost
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx
+else
+  echo ">> no certificate, no backup — bootstrap vhost, then issue via HTTP-01"
+  write_bootstrap_vhost
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx
+
+  certbot certonly --webroot -w /var/lib/letsencrypt \
+    $CERT_DOMAINS \
+    --non-interactive --agree-tos -m "$EMAIL" \
+    --deploy-hook "systemctl reload nginx"
+
+  echo ">> certificate issued — installing final vhost"
+  write_vhost
+  nginx -t
+  systemctl reload nginx
+fi
+
+echo ">> enabling certbot-renew.timer"
+systemctl enable --now certbot-renew.timer
+
+echo ">> done."
+echo "   nginx:          $(systemctl is-active nginx)"
+echo "   ${APP}.service: $(systemctl is-enabled "${APP}.service") / $(systemctl is-active "${APP}.service" || true)"
+echo "   renew timer:    $(systemctl is-active certbot-renew.timer)"
+certbot certificates 2>/dev/null | grep -E 'Certificate Name:|Domains:|Expiry' || true
+REMOTE
+
+echo ">> setup complete. Next: bin/secrets (seed app-config), then bin/deploy"
+echo "   (or bin/restore first to recover data prior to deploy)."

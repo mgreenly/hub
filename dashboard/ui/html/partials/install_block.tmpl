@@ -1,0 +1,22 @@
+{{define "install_block"}}
+  {{if .}}
+    <section class="install-block" aria-label="MCP connect instructions">
+      <h2>Connect an MCP client</h2>
+      <label class="mcp-picker">
+        <span class="mcp-picker-label">Service</span>
+        <select id="mcp-select">
+          {{range $i, $svc := .}}
+            <option value="{{$svc.ID}}"{{if eq $i 0}} selected{{end}}>{{$svc.Name}}</option>
+          {{end}}
+        </select>
+      </label>
+      {{range $i, $svc := .}}
+        <div class="mcp-instructions" data-mcp="{{$svc.ID}}"{{if ne $i 0}} hidden{{end}}>
+          {{range $svc.Cards}}
+            {{template "install_card" .}}
+          {{end}}
+        </div>
+      {{end}}
+    </section>
+  {{end}}
+{{end}}

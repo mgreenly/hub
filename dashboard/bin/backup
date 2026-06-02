@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# bin/backup — snapshot the dashboard's SQLite state AND its apex TLS cert to
+# s3://$METASPOT_BACKUP_BUCKET/<APP>/ under the per-app prefix convention.
+#
+# Layout:
+#   <APP>/dashboard.db.<UTC>.tar.gz   one immutable DB snapshot per run
+#   <APP>/latest                      pointer: the newest DB snapshot's key
+#   <APP>/cert/cert.<UTC>.tar.gz      one immutable cert snapshot per run
+#   <APP>/cert/latest                 pointer: the newest cert snapshot's key
+# Retention: keep the most recent 30 of each (count-based). The `latest`
+# pointers and the pre-restore/ sub-prefix are never pruned here.
+#
+# The cert snapshot is what makes teardown --purge-cert safe and lets bin/setup
+# rebuild the box without re-issuing (it pulls <APP>/cert/latest). It captures
+# all three Let's Encrypt pieces (archive + renewal + live symlinks) so renewal
+# survives a restore, with paths stored relative to / for a clean `tar -x -C /`.
+#
+# DB consistency: stop / copy / start. The cert is not mutated by the app, so
+# it is snapshotted separately without stopping anything.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO/etc/manifest.env"
+. "$REPO/etc/deploy.env"
+
+HOST="${HOST:-${ACCOUNT}.metaspot.org}"
+DOMAIN="${DOMAIN:-${ACCOUNT}.metaspot.org}"
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+echo ">> backup: ${SSH_USER}@${HOST}  db=/opt/${APP}/data/dashboard.db  cert=${DOMAIN}  -> s3://<bucket>/${APP}/"
+
+ssh -i "$SSH_KEY" "${SSH_USER}@${HOST}" sudo APP="$APP" DOMAIN="$DOMAIN" bash -s <<'REMOTE'
+set -euo pipefail
+: "${APP:?}" "${DOMAIN:?}"
+
+ENV_FILE=/etc/metaspot/env
+DATA_DIR="/opt/${APP}/data"
+DB_BASENAME=dashboard.db
+KEEP=30
+
+[ -r "$ENV_FILE" ] || { echo "!! $ENV_FILE missing" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+: "${METASPOT_BACKUP_BUCKET:?}"
+export AWS_DEFAULT_REGION="${METASPOT_AWS_REGION:-us-east-2}"
+BUCKET="$METASPOT_BACKUP_BUCKET"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+
+WORK="$(mktemp -d)"
+APP_WAS_STOPPED=0
+cleanup() {
+  if [ "$APP_WAS_STOPPED" = 1 ]; then
+    systemctl is-active --quiet "${APP}" || systemctl start "${APP}" || true
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# ---- DB snapshot (stop / copy / start) ----
+if [ ! -e "$DATA_DIR/$DB_BASENAME" ]; then
+  echo "!! $DATA_DIR/$DB_BASENAME does not exist — nothing to back up (has ${APP} started?)" >&2
+  exit 1
+fi
+
+DB_KEY="${APP}/${DB_BASENAME}.${STAMP}.tar.gz"
+echo ">> stopping ${APP} for a consistent DB copy"
+systemctl stop "${APP}"
+APP_WAS_STOPPED=1
+cp -p "$DATA_DIR/$DB_BASENAME"* "$WORK/"
+echo ">> restarting ${APP}"
+systemctl start "${APP}"
+APP_WAS_STOPPED=0
+
+tar -czf "$WORK/db.tar.gz" -C "$WORK" \
+  $(cd "$WORK" && ls "$DB_BASENAME"*)
+
+echo ">> uploading s3://$BUCKET/$DB_KEY"
+aws s3 cp --no-progress "$WORK/db.tar.gz" "s3://$BUCKET/$DB_KEY"
+printf '%s\n' "$DB_KEY" > "$WORK/db-latest"
+aws s3 cp --no-progress "$WORK/db-latest" "s3://$BUCKET/${APP}/latest"
+
+prune() {  # prune <prefix> — keep newest $KEEP objects under it
+  local prefix="$1"
+  mapfile -t KEYS < <(
+    aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$prefix" \
+      --query 'sort_by(Contents,&Key)[].Key' --output text 2>/dev/null \
+      | tr '\t' '\n' | sed '/^$/d' | grep -v '^None$' || true
+  )
+  local count="${#KEYS[@]}"
+  if [ "$count" -gt "$KEEP" ]; then
+    echo ">> pruning $((count - KEEP)) old snapshot(s) under $prefix (keep $KEEP)"
+    for ((i = 0; i < count - KEEP; i++)); do aws s3 rm "s3://$BUCKET/${KEYS[$i]}"; done
+  fi
+}
+prune "${APP}/${DB_BASENAME}."
+
+# ---- Cert snapshot (no app stop; cert is not app-mutated) ----
+CERT_LIVE="/etc/letsencrypt/live/${DOMAIN}"
+if [ -d "$CERT_LIVE" ]; then
+  CERT_KEY="${APP}/cert/cert.${STAMP}.tar.gz"
+  # paths relative to / so setup's `tar -x -C /` lands them back in place;
+  # live/ symlinks stored as-is (no -h), archive/ holds the real files.
+  tar -czf "$WORK/cert.tar.gz" -C / \
+    "etc/letsencrypt/archive/${DOMAIN}" \
+    "etc/letsencrypt/renewal/${DOMAIN}.conf" \
+    "etc/letsencrypt/live/${DOMAIN}"
+  echo ">> uploading s3://$BUCKET/$CERT_KEY"
+  aws s3 cp --no-progress "$WORK/cert.tar.gz" "s3://$BUCKET/$CERT_KEY"
+  printf '%s\n' "$CERT_KEY" > "$WORK/cert-latest"
+  aws s3 cp --no-progress "$WORK/cert-latest" "s3://$BUCKET/${APP}/cert/latest"
+  prune "${APP}/cert/cert."
+else
+  echo ">> no cert at $CERT_LIVE — skipping cert snapshot"
+fi
+
+echo ">> backup complete."
+REMOTE

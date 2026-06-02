@@ -1,0 +1,28 @@
+module notify
+
+go 1.26
+
+require (
+	eventplane v0.0.0
+	modernc.org/sqlite v1.50.1
+)
+
+// The shared event-plane library is a sibling source tree, not a published
+// module. go.work resolves it for local dev; this committed replace makes
+// bin/build deterministic with or without the workspace. The ledger clone this
+// repo was duplicated from is eventplane-free, so both the require above and
+// this replace are ADDED here — notify is the first consumer of the library's
+// consumer half (decision 12).
+replace eventplane => ../eventplane
+
+require (
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	golang.org/x/sys v0.42.0 // indirect
+	modernc.org/libc v1.72.3 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.11.0 // indirect
+)

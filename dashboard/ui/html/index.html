@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>metaspot dashboard</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="banner">
+    <h1>metaspot</h1>
+    <nav class="identity-action-stack">
+      {{if .Owner}}
+        <span class="signed-in-email">{{.Owner}}</span>
+        <form method="POST" action="/logout">
+          <button type="submit">Sign out</button>
+        </form>
+      {{else}}
+        <a href="/login" class="signin-link">Sign in</a>
+      {{end}}
+    </nav>
+  </header>
+
+  <main class="content-block">
+    {{if .Owner}}
+      <p>Signed in to the dashboard for <strong>{{.Host}}</strong>.</p>
+      <section class="grants">
+        <h2>Connected MCP clients</h2>
+        <div id="grants-block" data-stream="/grants/stream" data-fragment="/grants/fragment">
+          {{template "grants_block" .Grants}}
+        </div>
+      </section>
+      {{template "install_block" .Installs}}
+    {{else}}
+      <section class="landing">
+        <h2>{{.Host}}</h2>
+        <p>This box is online. Sign in to manage its services.</p>
+        <section class="connect-agent" aria-label="Connect your coding agent">
+          <h3>Connect your coding agent</h3>
+          <p>Paste this into your terminal — or into Claude Code — to wire this box's MCP services into your install:</p>
+          <pre class="connect-command"><code>curl -fsSL {{.Scheme}}://{{.Host}}/install | bash</code></pre>
+        </section>
+      </section>
+    {{end}}
+  </main>
+
+  <footer class="site-footer">
+    <small>metaspot &middot; {{.Host}}</small>
+  </footer>
+</body>
+</html>

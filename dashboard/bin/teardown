@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# bin/teardown — the inverse of bin/setup: remove the dashboard's footprint
+# from the box. Non-destructive by default; the irrecoverable/expensive pieces
+# are gated behind explicit flags.
+#
+#   bin/teardown                  remove unit + apex nginx block + app code;
+#                                 PRESERVE /opt/dashboard/data and the TLS cert.
+#   bin/teardown --purge-data     also rm -rf /opt/dashboard and userdel dashboard.
+#   bin/teardown --purge-cert     also `certbot delete` the apex cert (recoverable
+#                                 from S3 if bin/backup ran; setup re-restores it).
+#   bin/teardown --purge-all      both of the above.
+#
+# Never touches shared box state: packages, /var/lib/letsencrypt, the
+# certbot-renew.timer, the conf.d/locations/ dir if any service fragment
+# remains, or the api/hal vhosts. Safe to run repeatedly / on a half-torn box.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+. etc/manifest.env
+. etc/deploy.env
+
+HOST="${HOST:-${ACCOUNT}.metaspot.org}"
+DOMAIN="${DOMAIN:-${ACCOUNT}.metaspot.org}"
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+PURGE_CERT=0
+PURGE_DATA=0
+for arg in "$@"; do
+  case "$arg" in
+    --purge-cert) PURGE_CERT=1 ;;
+    --purge-data) PURGE_DATA=1 ;;
+    --purge-all)  PURGE_CERT=1; PURGE_DATA=1 ;;
+    *) echo "usage: bin/teardown [--purge-cert] [--purge-data] [--purge-all]" >&2; exit 2 ;;
+  esac
+done
+
+echo ">> teardown: ${SSH_USER}@${HOST}  app=${APP}  domain=${DOMAIN}"
+echo "   data: $([ "$PURGE_DATA" = 1 ] && echo 'PURGE (rm -rf /opt/'"${APP}"' + userdel)' || echo 'preserve /opt/'"${APP}"'/data')"
+echo "   cert: $([ "$PURGE_CERT" = 1 ] && echo 'PURGE (certbot delete '"${DOMAIN}"')' || echo 'preserve '"${DOMAIN}")"
+
+ssh -i "$SSH_KEY" "${SSH_USER}@${HOST}" \
+  "sudo APP='$APP' DOMAIN='$DOMAIN' \
+        PURGE_CERT='$PURGE_CERT' PURGE_DATA='$PURGE_DATA' \
+        bash -s" <<'REMOTE'
+set -euo pipefail
+: "${APP:?}" "${DOMAIN:?}"
+PURGE_CERT="${PURGE_CERT:-0}"
+PURGE_DATA="${PURGE_DATA:-0}"
+
+echo ">> stop + remove systemd unit"
+systemctl stop    "${APP}.service" 2>/dev/null || true
+systemctl disable "${APP}.service" 2>/dev/null || true
+rm -f "/etc/systemd/system/${APP}.service"
+systemctl daemon-reload
+
+echo ">> remove apex nginx block"
+rm -f "/etc/nginx/conf.d/${APP}.conf"
+# locations/ is shared; remove only if no service fragment remains.
+rmdir /etc/nginx/conf.d/locations 2>/dev/null && echo "   removed empty conf.d/locations/" || true
+if nginx -t 2>/dev/null; then
+  systemctl reload nginx
+else
+  echo "!! nginx -t failed after removing ${APP}.conf — NOT reloading (inspect manually)" >&2
+fi
+
+echo ">> app files"
+if [ "$PURGE_DATA" = 1 ]; then
+  rm -rf "/opt/${APP}"
+  userdel "${APP}" 2>/dev/null || true
+  echo "   purged /opt/${APP} and user ${APP}"
+else
+  rm -rf "/opt/${APP}/bin" "/opt/${APP}/etc"
+  echo "   removed code; preserved /opt/${APP}/data (and user ${APP})"
+fi
+
+echo ">> certificate"
+if [ "$PURGE_CERT" = 1 ]; then
+  certbot delete --cert-name "${DOMAIN}" --non-interactive 2>/dev/null \
+    && echo "   deleted cert ${DOMAIN}" \
+    || echo "   no cert ${DOMAIN} to delete (or certbot delete failed)"
+else
+  echo "   preserved cert ${DOMAIN}"
+fi
+
+echo ">> teardown complete."
+REMOTE
+
+echo ">> done."
