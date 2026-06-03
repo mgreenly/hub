@@ -1,11 +1,14 @@
 # hub
 
 The deployable **application suite** for metaspot — the dashboard plus its
-services that run *on* a metaspot box. This folder is just a parent holding five
-**independent git repos** (each has its own `.git`); `hub` itself is not a repo.
-Four are the on-box suite (below); the fifth, `marketplace`, is a GitHub-hosted
-plugin marketplace for delivering skills/commands (and Claude Code MCP config)
-to Claude clients — not an on-box service.
+services that run *on* a metaspot box. `hub` is a **single mono-repo** (one
+`.git`): the dashboard, the path-routed services, the shared `eventplane`
+library, the local-dev `nginx` front door, and `docs` all live here as
+**subdirectories of this one repo** — they are *not* independent repos. The only
+related project that lives **outside** hub is `marketplace`
+(`mgreenly/marketplace`, public, GitHub-hosted) — a plugin marketplace for
+delivering skills/commands (and Claude Code MCP config) to Claude clients,
+**not** an on-box service.
 
 The **infrastructure** half of the system lives in the sibling repo
 `../metaspot` (Terraform: AWS org/accounts, DNS, the one-box-per-customer
@@ -36,13 +39,23 @@ before proxying, so a service's internal routes stay `/contacts`, `/mcp`, etc.
 
 ## The projects
 
-| dir | role | runtime | loopback port | git |
-|---|---|---|---|---|
-| **dashboard** | apex/`DEFAULT` app: OAuth AS, IAM, push, install landing, service inventory | Go (`module dashboard`), SQLite (`dashboard.db`) | **3000** | own repo |
-| **crm** | path-routed service `/srv/crm/` — contacts domain + MCP | Go (`module crm`), SQLite | **3001** | own repo |
-| **ledger** | path-routed service `/srv/ledger/` — newest, skeleton (whoami-only, cloned from crm) | Go (`module ledger`) | **3002** | own repo |
-| **nginx** | local-dev front door (:8080) mirroring the prod `/srv/<svc>/` routing | nginx conf + `run` script | — | own repo |
-| **marketplace** | plugin marketplace — delivers skills/commands (and Claude Code MCP config) to Claude clients; **not** an on-box service | GitHub-hosted | — | own repo (`mgreenly/marketplace`, public) |
+All of these are **subdirectories of this one repo**, except `marketplace`
+(the lone separate GitHub repo, listed last for context).
+
+| dir | role | runtime | loopback port |
+|---|---|---|---|
+| **dashboard** | apex/`DEFAULT` app: OAuth AS, IAM, push, install landing, service inventory | Go (`module dashboard`), SQLite (`dashboard.db`) | **3000** |
+| **crm** | path-routed service `/srv/crm/` — contacts domain + MCP; event-plane **producer** (`/feed` outbox) | Go (`module crm`), SQLite | **3001** |
+| **ledger** | path-routed service `/srv/ledger/` — skeleton (whoami-only, cloned from crm) | Go (`module ledger`) | **3002** |
+| **notify** | path-routed service `/srv/notify/` — event-plane **consumer** (push on crm's `/feed`); the worked example for bringing up a new consumer | Go (`module notify`) | **3003** |
+| **eventplane** | shared Go **library** — the event-plane producer/consumer plumbing, consumed via a committed `replace eventplane => ../eventplane` | Go (`module eventplane`) | — |
+| **nginx** | local-dev front door (:8080) mirroring the prod `/srv/<svc>/` routing | nginx conf + `run` script | — |
+| **docs** | suite-level docs (the event-plane protocol/decision write-ups) | Markdown | — |
+| **marketplace** *(separate repo)* | plugin marketplace — delivers skills/commands (and Claude Code MCP config) to Claude clients; **not** an on-box service | GitHub-hosted (`mgreenly/marketplace`, public) | — |
+
+The Go modules (`crm`, `dashboard`, `eventplane`, `ledger`, `notify`) are wired
+together for local dev by the root `go.work`; production `bin/build` does **not**
+depend on it (see Deployments).
 
 Each service exposes a no-side-effect `<svc>_whoami` MCP tool (proves the
 plugin → connector → dashboard OAuth → service chain end to end). Services keep
@@ -65,15 +78,16 @@ their own per-service audit store; the dashboard audits auth/token/grant events.
 
 `nginx/run` is the dev front door on **:8080** — it computes its own dir, proxies
 the apex to dashboard (:3000), and includes `nginx/locations/*.conf` (the dev
-mirror of each prod `/srv/<svc>/` fragment, currently crm + ledger). Run each Go
-service on its loopback port, then `cd nginx && ./run`.
+mirror of each prod `/srv/<svc>/` fragment, currently crm, ledger + notify). Run
+each Go service on its loopback port, then `cd nginx && ./run`.
 
 ## Deployments (how to ship to the box)
 
 Production is the box at `<account>.metaspot.org` (first/only account: **ai**).
-**There are no git remotes — deploy is rsync of built artifacts, not `git push`.**
-Commits are local version-control hygiene; shipping is the `bin/*` scripts below.
-Work the repos in dependency order and verify on the box after each step.
+**Deploy is rsync of built artifacts, not `git push`.** The repo has a GitHub
+remote (`origin` → `mgreenly/hub`) for version-control backup, but pushing there
+ships nothing to the box; shipping is the `bin/*` scripts below. Work the
+services in dependency order and verify on the box after each step.
 
 **The `bin/*` lifecycle, setup → teardown** (services ship a subset; the
 dashboard ships them all — see Per-service conventions): `setup` (one-time
@@ -93,8 +107,8 @@ ai` — interactive, the user runs it; the token expires).
 → `build/<app>.bin` (the Go binary) **and** `build/<app>` (a shell wrapper that
 becomes `/opt/<app>/bin/run`; sets non-secret public config from `METASPOT_DOMAIN`
 and execs the binary on `127.0.0.1:$PORT`). Eventplane consumers carry a committed
-`replace eventplane => ../eventplane`, so the build needs the sibling source tree
-but no network/go.work.
+`replace eventplane => ../eventplane`, so the build needs the in-repo `eventplane/`
+module tree but no network/`go.work`.
 
 **`bin/deploy`** — `build` → `ssh systemctl stop` → rsync `build/<app>`→
 `/opt/<app>/bin/run`, `build/<app>.bin`→`/opt/<app>/bin/<app>.bin`,
@@ -163,7 +177,7 @@ forced the split. The vast majority of users are **Claude Chat / Cowork**;
   No bundling exists; a single aggregating endpoint was rejected (too many tools).
 - **Claude Code (the minority): plugin marketplace and/or the install script.**
   The localhost callback works here, so the plugin marketplace
-  (`mgreenly/marketplace` — public, a fifth repo under `hub/`, plugin
+  (`mgreenly/marketplace` — public, a **separate** GitHub repo, plugin
   `metaspot-suite@metaspot`) and the `curl … | sh` script (which runs
   `claude mcp add --transport http` per service) both work.
 
@@ -175,13 +189,23 @@ which is useful independent of the connector story above.
 Chat/Cowork; script/marketplace for Claude Code) — not automation; the
 per-service connector add is irreducible for Cowork.
 
-## Gotcha from the 2026-06 move
+## Gotchas from the 2026-06 moves
 
-These projects used to live directly under `~/projects/`; they were moved into
-`~/projects/hub/`. The sub-projects' own docs still reference the **old**
-sibling-relative path `../metaspot` (e.g. `crm/CLAUDE.md`), which from
-`hub/<svc>/` now resolves to the non-existent `hub/metaspot` — the correct
-relative path is `../../metaspot` from a service, or `../metaspot` from this hub
-root. A few comments still name `~/projects/nginx` (now `~/projects/hub/nginx`).
-All cosmetic — code (Go module names, nginx's self-locating `run`, relative
-includes) is unaffected.
+Two structural changes happened in 2026-06, and stale references to the old
+shape survive in places:
+
+1. **Projects moved under `hub/`.** They used to live directly under
+   `~/projects/`; they were moved into `~/projects/hub/`. Sub-project docs still
+   reference the **old** sibling-relative path `../metaspot` (e.g.
+   `crm/CLAUDE.md`), which from `hub/<svc>/` now resolves to the non-existent
+   `hub/metaspot` — the correct relative path is `../../metaspot` from a service,
+   or `../metaspot` from this hub root. A few comments still name
+   `~/projects/nginx` (now `~/projects/hub/nginx`).
+2. **`hub/` became a single mono-repo.** What were separate per-project git
+   repos are now plain subdirectories of one repo (one `.git` at the hub root).
+   Sub-project docs that still describe themselves as standalone repos (their own
+   `.git`, "deploy is `git push`", etc.) are describing the pre-mono-repo shape.
+
+All of this is cosmetic/documentary — code (Go module names, the root `go.work`,
+nginx's self-locating `run`, relative includes, the `replace eventplane =>
+../eventplane` directives) is unaffected.
